@@ -1,0 +1,494 @@
+use image::io::Reader as ImageReader;
+use image::{imageops, ImageBuffer, Rgb, Rgba};
+use imageproc::{self, gray_image};
+use std::cmp::min;
+use term_size;
+
+const RESET: &str = "\x1b[0m";
+// Define the block elements and ANSI color codes as constants
+const UPPER_HALF_BLOCK: char = '\u{2580}';
+const LOWER_HALF_BLOCK: char = '\u{2584}';
+const FULL_BLOCK: char = '\u{2588}';
+const SPACE: char = ' ';
+
+fn main() -> Result<(), std::io::Error> {
+    let img_path = "/home/cesarli/Pictures/firered.png";
+    let img = ImageReader::open(img_path)
+        .unwrap()
+        .decode()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .to_rgba8();
+
+    let (orig_width, orig_height) = img.dimensions();
+
+    // Determine the new size based on terminal size or user input
+    let (width, height) = determine_size(orig_width, orig_height);
+
+    // Resize the image to the new dimensions
+    let resized_img = image::imageops::resize(&img, width, height, imageops::FilterType::Lanczos3);
+
+    // Generate ASCII art from the resized image
+    let ascii_art = image_to_colour_ascii(&resized_img);
+    println!("{}", ascii_art);
+
+    Ok(())
+}
+
+fn image_to_ascii(image: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> String {
+    let grayscale_ramp = " ▄█";
+    let ramp_length = grayscale_ramp.len() as u32;
+
+    let mut ascii_img = String::new();
+    let (width, height) = image.dimensions();
+
+    for y in (0..height).step_by(2) {
+        for x in 0..width {
+            let pixel_upper = image.get_pixel(x, y);
+            let pixel_lower = if y + 1 < height {
+                image.get_pixel(x, y + 1)
+            } else {
+                pixel_upper // Use the same pixel if y + 1 is out of bounds
+            };
+            let Rgba([r_upper, g_upper, b_upper, _]) = *pixel_upper;
+            let Rgba([r_lower, g_lower, b_lower, _]) = *pixel_lower;
+            // Weighted average for human perception
+            let intensity_upper =
+                (0.3 * r_upper as f32 + 0.59 * g_upper as f32 + 0.11 * b_upper as f32) as u32;
+            let intensity_lower =
+                (0.3 * r_lower as f32 + 0.59 * g_lower as f32 + 0.11 * b_lower as f32) as u32;
+            let ramp_index_upper = (intensity_upper * (ramp_length - 1) / 255) as usize;
+            let ramp_index_lower = (intensity_lower * (ramp_length - 1) / 255) as usize;
+            let ascii_char_upper = grayscale_ramp.chars().nth(ramp_index_upper).unwrap_or(' '); // Default to space if out of bounds
+            let ascii_char_lower = grayscale_ramp.chars().nth(ramp_index_lower).unwrap_or(' ');
+
+            ascii_img.push(ascii_char_upper);
+            ascii_img.push(ascii_char_lower);
+        }
+        ascii_img.push('\n'); // Add a newline at the end of each row
+    }
+
+    ascii_img
+}
+
+fn image_to_colour_ascii(image: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> String {
+    // Define the block elements and space characters
+    let grayscale_ramp = " ░▒▓█";
+
+    let gray_image = image_to_grayscale(image);
+    // Calculate the mean pixel value
+    let total_pixels = (gray_image.width() * gray_image.height()) as u32;
+    let sum_pixel_values: u32 = gray_image
+        .enumerate_pixels()
+        .map(|(_x, _y, p)| p[0] as u32)
+        .sum();
+    let mean_pixel_value = (((sum_pixel_values / total_pixels) as f32).sqrt()) as u8;
+
+    let edges = imageproc::edges::canny(&gray_image, mean_pixel_value as f32, 255.0);
+    let mut ascii_img = String::new();
+    let (width, height) = image.dimensions();
+
+    for y in (0..height).step_by(2) {
+        for x in 0..width {
+            let pixel_upper = image.get_pixel(x, y);
+            let pixel_lower = if y + 1 < height {
+                image.get_pixel(x, y + 1)
+            } else {
+                pixel_upper // Use the same pixel if y + 1 is out of bounds
+            };
+
+            let color_index_upper = find_colour_index(&pixel_upper.0);
+            let color_index_lower = find_colour_index(&pixel_lower.0);
+
+            let ascii_char_upper = grayscale_ramp
+                .chars()
+                .nth(color_index_upper as usize)
+                .unwrap_or(' '); // Use space if out of bounds
+            let ascii_char_lower = grayscale_ramp
+                .chars()
+                .nth(color_index_lower as usize)
+                .unwrap_or(' ');
+
+            let is_edge = (x > 0 && edges.get_pixel(x - 1, y)[0] > mean_pixel_value)
+                || (x < width - 1 && edges.get_pixel(x + 1, y)[0] > mean_pixel_value)
+                || edges.get_pixel(x, y)[0] > mean_pixel_value
+                || (y < height - 1 && edges.get_pixel(x, y + 1)[0] > mean_pixel_value);
+
+            let ascii_char = if is_edge { '▀' } else { ascii_char_upper };
+
+            ascii_img.push_str(&format!("\x1b[38;5;{}m{}", color_index_upper, ascii_char));
+            ascii_img.push_str(&format!(
+                "\x1b[48;5;{}m{}",
+                color_index_lower, ascii_char_lower
+            ));
+        }
+        ascii_img.push('\n'); // Add a newline at the end of each row
+    }
+    ascii_img
+}
+
+fn find_colour_index(pixel: &[u8]) -> u8 {
+    let pixel_r = pixel[0] as i32;
+    let pixel_g = pixel[1] as i32;
+    let pixel_b = pixel[2] as i32;
+
+    ANSI_COLOURS[16..256]
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, &(ansi_r, ansi_g, ansi_b))| {
+            let dr = ansi_r - pixel_r;
+            let dg = ansi_g - pixel_g;
+            let db = ansi_b - pixel_b;
+            dr * dr + dg * dg + db * db
+        })
+        .map(|v| 16 + v.0 as u8)
+        .unwrap_or(0)
+}
+
+fn image_to_grayscale(
+    image: &ImageBuffer<Rgba<u8>, Vec<u8>>,
+) -> ImageBuffer<image::Luma<u8>, Vec<u8>> {
+    imageproc::map::map_colors(image, |p| {
+        let grayscale_value = (0.3 * p[0] as f32 + 0.59 * p[1] as f32 + 0.11 * p[2] as f32) as u8;
+        image::Luma([grayscale_value])
+    })
+}
+
+// Function to calculate the ANSI color from a pixel
+fn ansi_colour_from_pixel(pixel_upper: &Rgba<u8>, pixel_lower: &Rgba<u8>) -> (String, String) {
+    let Rgba([r_u, g_u, b_u, _]) = *pixel_upper;
+    let Rgba([r_l, g_l, b_l, _]) = *pixel_lower;
+    let rgb_upper = (r_u as i32, g_u as i32, b_u as i32);
+    let rgb_lower = (r_l as i32, g_l as i32, b_l as i32);
+
+    // Find the closest ANSI color
+    let fg_closest_color = find_closest_ansi_colour(rgb_upper);
+    let bg_closest_color = find_closest_ansi_colour(rgb_lower);
+
+    // Return the ANSI color code
+    (
+        format!(
+            "\x1b[38;2;{};{};{}m",
+            fg_closest_color.0, fg_closest_color.1, fg_closest_color.2
+        ),
+        format!(
+            "\x1b[48;2;{};{};{}m",
+            bg_closest_color.0, bg_closest_color.1, bg_closest_color.2
+        ),
+    )
+}
+
+fn find_closest_ansi_colour(rgb: (i32, i32, i32)) -> (i32, i32, i32) {
+    let mut closest_color = (0, 0, 0);
+    let mut smallest_distance = i32::MAX;
+    for &ansi_rgb in ANSI_COLOURS.iter() {
+        let distance = colour_distance_calculator(rgb, ansi_rgb);
+        if distance < smallest_distance {
+            smallest_distance = distance;
+            closest_color = ansi_rgb;
+        }
+    }
+    closest_color
+}
+
+fn colour_distance_calculator(rgb: (i32, i32, i32), ansi_rgb: (i32, i32, i32)) -> i32 {
+    let (r1, g1, b1) = rgb;
+    let (r2, g2, b2) = ansi_rgb;
+    let r_mean = (r1 + r2) / 2;
+    let r = r1 - r2;
+    let g = g1 - g2;
+    let b = b1 - b2;
+    (((512 + r_mean) * r * r) >> 8) + 4 * g * g + (((767 - r_mean) * b * b) >> 8)
+}
+
+fn determine_size(orig_width: u32, orig_height: u32) -> (u32, u32) {
+    // Get terminal size
+    let (term_width, term_height) = match term_size::dimensions() {
+        Some((w, h)) => (w as u32, h as u32), // Multiply height by 2 to account for character aspect ratio
+        None => (orig_width, orig_height), // Use original size if terminal size cannot be determined
+    };
+
+    // Calculate the target width and height based on the terminal dimensions
+    fit_to_size(orig_width, orig_height, Some(term_width), Some(term_height))
+}
+
+fn scale_dimension(other: u32, orig_this: u32, orig_other: u32) -> u32 {
+    (orig_this as f32 * other as f32 / orig_other as f32 + 0.5) as u32
+}
+
+fn fit_to_size(
+    orig_width: u32,
+    orig_height: u32,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+) -> (u32, u32) {
+    let target_width = max_width.unwrap_or(orig_width);
+    let target_height = max_height.unwrap_or(orig_height);
+
+    let scaled_width = scale_dimension(target_height, orig_width, orig_height);
+    let scaled_height = scale_dimension(target_width, orig_height, orig_width);
+
+    if scaled_width <= target_width {
+        (scaled_width, target_height)
+    } else {
+        (target_width, scaled_height)
+    }
+}
+
+static ANSI_COLOURS: [(i32, i32, i32); 256] = [
+    (0x00, 0x00, 0x00),
+    (0x80, 0x00, 0x00),
+    (0x00, 0x80, 0x00),
+    (0x80, 0x80, 0x00),
+    (0x00, 0x00, 0x80),
+    (0x80, 0x00, 0x80),
+    (0x00, 0x80, 0x80),
+    (0xc0, 0xc0, 0xc0),
+    (0x80, 0x80, 0x80),
+    (0xff, 0x00, 0x00),
+    (0x00, 0xff, 0x00),
+    (0xff, 0xff, 0x00),
+    (0x00, 0x00, 0xff),
+    (0xff, 0x00, 0xff),
+    (0x00, 0xff, 0xff),
+    (0xff, 0xff, 0xff),
+    (0x00, 0x00, 0x00),
+    (0x00, 0x00, 0x5f),
+    (0x00, 0x00, 0x87),
+    (0x00, 0x00, 0xaf),
+    (0x00, 0x00, 0xd7),
+    (0x00, 0x00, 0xff),
+    (0x00, 0x5f, 0x00),
+    (0x00, 0x5f, 0x5f),
+    (0x00, 0x5f, 0x87),
+    (0x00, 0x5f, 0xaf),
+    (0x00, 0x5f, 0xd7),
+    (0x00, 0x5f, 0xff),
+    (0x00, 0x87, 0x00),
+    (0x00, 0x87, 0x5f),
+    (0x00, 0x87, 0x87),
+    (0x00, 0x87, 0xaf),
+    (0x00, 0x87, 0xd7),
+    (0x00, 0x87, 0xff),
+    (0x00, 0xaf, 0x00),
+    (0x00, 0xaf, 0x5f),
+    (0x00, 0xaf, 0x87),
+    (0x00, 0xaf, 0xaf),
+    (0x00, 0xaf, 0xd7),
+    (0x00, 0xaf, 0xff),
+    (0x00, 0xd7, 0x00),
+    (0x00, 0xd7, 0x5f),
+    (0x00, 0xd7, 0x87),
+    (0x00, 0xd7, 0xaf),
+    (0x00, 0xd7, 0xd7),
+    (0x00, 0xd7, 0xff),
+    (0x00, 0xff, 0x00),
+    (0x00, 0xff, 0x5f),
+    (0x00, 0xff, 0x87),
+    (0x00, 0xff, 0xaf),
+    (0x00, 0xff, 0xd7),
+    (0x00, 0xff, 0xff),
+    (0x5f, 0x00, 0x00),
+    (0x5f, 0x00, 0x5f),
+    (0x5f, 0x00, 0x87),
+    (0x5f, 0x00, 0xaf),
+    (0x5f, 0x00, 0xd7),
+    (0x5f, 0x00, 0xff),
+    (0x5f, 0x5f, 0x00),
+    (0x5f, 0x5f, 0x5f),
+    (0x5f, 0x5f, 0x87),
+    (0x5f, 0x5f, 0xaf),
+    (0x5f, 0x5f, 0xd7),
+    (0x5f, 0x5f, 0xff),
+    (0x5f, 0x87, 0x00),
+    (0x5f, 0x87, 0x5f),
+    (0x5f, 0x87, 0x87),
+    (0x5f, 0x87, 0xaf),
+    (0x5f, 0x87, 0xd7),
+    (0x5f, 0x87, 0xff),
+    (0x5f, 0xaf, 0x00),
+    (0x5f, 0xaf, 0x5f),
+    (0x5f, 0xaf, 0x87),
+    (0x5f, 0xaf, 0xaf),
+    (0x5f, 0xaf, 0xd7),
+    (0x5f, 0xaf, 0xff),
+    (0x5f, 0xd7, 0x00),
+    (0x5f, 0xd7, 0x5f),
+    (0x5f, 0xd7, 0x87),
+    (0x5f, 0xd7, 0xaf),
+    (0x5f, 0xd7, 0xd7),
+    (0x5f, 0xd7, 0xff),
+    (0x5f, 0xff, 0x00),
+    (0x5f, 0xff, 0x5f),
+    (0x5f, 0xff, 0x87),
+    (0x5f, 0xff, 0xaf),
+    (0x5f, 0xff, 0xd7),
+    (0x5f, 0xff, 0xff),
+    (0x87, 0x00, 0x00),
+    (0x87, 0x00, 0x5f),
+    (0x87, 0x00, 0x87),
+    (0x87, 0x00, 0xaf),
+    (0x87, 0x00, 0xd7),
+    (0x87, 0x00, 0xff),
+    (0x87, 0x5f, 0x00),
+    (0x87, 0x5f, 0x5f),
+    (0x87, 0x5f, 0x87),
+    (0x87, 0x5f, 0xaf),
+    (0x87, 0x5f, 0xd7),
+    (0x87, 0x5f, 0xff),
+    (0x87, 0x87, 0x00),
+    (0x87, 0x87, 0x5f),
+    (0x87, 0x87, 0x87),
+    (0x87, 0x87, 0xaf),
+    (0x87, 0x87, 0xd7),
+    (0x87, 0x87, 0xff),
+    (0x87, 0xaf, 0x00),
+    (0x87, 0xaf, 0x5f),
+    (0x87, 0xaf, 0x87),
+    (0x87, 0xaf, 0xaf),
+    (0x87, 0xaf, 0xd7),
+    (0x87, 0xaf, 0xff),
+    (0x87, 0xd7, 0x00),
+    (0x87, 0xd7, 0x5f),
+    (0x87, 0xd7, 0x87),
+    (0x87, 0xd7, 0xaf),
+    (0x87, 0xd7, 0xd7),
+    (0x87, 0xd7, 0xff),
+    (0x87, 0xff, 0x00),
+    (0x87, 0xff, 0x5f),
+    (0x87, 0xff, 0x87),
+    (0x87, 0xff, 0xaf),
+    (0x87, 0xff, 0xd7),
+    (0x87, 0xff, 0xff),
+    (0xaf, 0x00, 0x00),
+    (0xaf, 0x00, 0x5f),
+    (0xaf, 0x00, 0x87),
+    (0xaf, 0x00, 0xaf),
+    (0xaf, 0x00, 0xd7),
+    (0xaf, 0x00, 0xff),
+    (0xaf, 0x5f, 0x00),
+    (0xaf, 0x5f, 0x5f),
+    (0xaf, 0x5f, 0x87),
+    (0xaf, 0x5f, 0xaf),
+    (0xaf, 0x5f, 0xd7),
+    (0xaf, 0x5f, 0xff),
+    (0xaf, 0x87, 0x00),
+    (0xaf, 0x87, 0x5f),
+    (0xaf, 0x87, 0x87),
+    (0xaf, 0x87, 0xaf),
+    (0xaf, 0x87, 0xd7),
+    (0xaf, 0x87, 0xff),
+    (0xaf, 0xaf, 0x00),
+    (0xaf, 0xaf, 0x5f),
+    (0xaf, 0xaf, 0x87),
+    (0xaf, 0xaf, 0xaf),
+    (0xaf, 0xaf, 0xd7),
+    (0xaf, 0xaf, 0xff),
+    (0xaf, 0xd7, 0x00),
+    (0xaf, 0xd7, 0x5f),
+    (0xaf, 0xd7, 0x87),
+    (0xaf, 0xd7, 0xaf),
+    (0xaf, 0xd7, 0xd7),
+    (0xaf, 0xd7, 0xff),
+    (0xaf, 0xff, 0x00),
+    (0xaf, 0xff, 0x5f),
+    (0xaf, 0xff, 0x87),
+    (0xaf, 0xff, 0xaf),
+    (0xaf, 0xff, 0xd7),
+    (0xaf, 0xff, 0xff),
+    (0xd7, 0x00, 0x00),
+    (0xd7, 0x00, 0x5f),
+    (0xd7, 0x00, 0x87),
+    (0xd7, 0x00, 0xaf),
+    (0xd7, 0x00, 0xd7),
+    (0xd7, 0x00, 0xff),
+    (0xd7, 0x5f, 0x00),
+    (0xd7, 0x5f, 0x5f),
+    (0xd7, 0x5f, 0x87),
+    (0xd7, 0x5f, 0xaf),
+    (0xd7, 0x5f, 0xd7),
+    (0xd7, 0x5f, 0xff),
+    (0xd7, 0x87, 0x00),
+    (0xd7, 0x87, 0x5f),
+    (0xd7, 0x87, 0x87),
+    (0xd7, 0x87, 0xaf),
+    (0xd7, 0x87, 0xd7),
+    (0xd7, 0x87, 0xff),
+    (0xd7, 0xaf, 0x00),
+    (0xd7, 0xaf, 0x5f),
+    (0xd7, 0xaf, 0x87),
+    (0xd7, 0xaf, 0xaf),
+    (0xd7, 0xaf, 0xd7),
+    (0xd7, 0xaf, 0xff),
+    (0xd7, 0xd7, 0x00),
+    (0xd7, 0xd7, 0x5f),
+    (0xd7, 0xd7, 0x87),
+    (0xd7, 0xd7, 0xaf),
+    (0xd7, 0xd7, 0xd7),
+    (0xd7, 0xd7, 0xff),
+    (0xd7, 0xff, 0x00),
+    (0xd7, 0xff, 0x5f),
+    (0xd7, 0xff, 0x87),
+    (0xd7, 0xff, 0xaf),
+    (0xd7, 0xff, 0xd7),
+    (0xd7, 0xff, 0xff),
+    (0xff, 0x00, 0x00),
+    (0xff, 0x00, 0x5f),
+    (0xff, 0x00, 0x87),
+    (0xff, 0x00, 0xaf),
+    (0xff, 0x00, 0xd7),
+    (0xff, 0x00, 0xff),
+    (0xff, 0x5f, 0x00),
+    (0xff, 0x5f, 0x5f),
+    (0xff, 0x5f, 0x87),
+    (0xff, 0x5f, 0xaf),
+    (0xff, 0x5f, 0xd7),
+    (0xff, 0x5f, 0xff),
+    (0xff, 0x87, 0x00),
+    (0xff, 0x87, 0x5f),
+    (0xff, 0x87, 0x87),
+    (0xff, 0x87, 0xaf),
+    (0xff, 0x87, 0xd7),
+    (0xff, 0x87, 0xff),
+    (0xff, 0xaf, 0x00),
+    (0xff, 0xaf, 0x5f),
+    (0xff, 0xaf, 0x87),
+    (0xff, 0xaf, 0xaf),
+    (0xff, 0xaf, 0xd7),
+    (0xff, 0xaf, 0xff),
+    (0xff, 0xd7, 0x00),
+    (0xff, 0xd7, 0x5f),
+    (0xff, 0xd7, 0x87),
+    (0xff, 0xd7, 0xaf),
+    (0xff, 0xd7, 0xd7),
+    (0xff, 0xd7, 0xff),
+    (0xff, 0xff, 0x00),
+    (0xff, 0xff, 0x5f),
+    (0xff, 0xff, 0x87),
+    (0xff, 0xff, 0xaf),
+    (0xff, 0xff, 0xd7),
+    (0xff, 0xff, 0xff),
+    (0x08, 0x08, 0x08),
+    (0x12, 0x12, 0x12),
+    (0x1c, 0x1c, 0x1c),
+    (0x26, 0x26, 0x26),
+    (0x30, 0x30, 0x30),
+    (0x3a, 0x3a, 0x3a),
+    (0x44, 0x44, 0x44),
+    (0x4e, 0x4e, 0x4e),
+    (0x58, 0x58, 0x58),
+    (0x60, 0x60, 0x60),
+    (0x66, 0x66, 0x66),
+    (0x76, 0x76, 0x76),
+    (0x80, 0x80, 0x80),
+    (0x8a, 0x8a, 0x8a),
+    (0x94, 0x94, 0x94),
+    (0x9e, 0x9e, 0x9e),
+    (0xa8, 0xa8, 0xa8),
+    (0xb2, 0xb2, 0xb2),
+    (0xbc, 0xbc, 0xbc),
+    (0xc6, 0xc6, 0xc6),
+    (0xd0, 0xd0, 0xd0),
+    (0xda, 0xda, 0xda),
+    (0xe4, 0xe4, 0xe4),
+    (0xee, 0xee, 0xee),
+];
